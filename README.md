@@ -312,7 +312,7 @@ Each month's **events** are counted on the date they happened:
 
 **Data model**
 - **Ageing Profile can't filter the severity tiles.** Age buckets and severities are stored as separate totals per row, so "Critical findings older than 90 days" can't be derived. Fixing this needs a long-format redesign of the monthly file (one count per release, month, state, severity and bucket).
-- **SCA tab has no data.** Open source findings are excluded by design (QBE uses Mend).
+- **SCA tab has no data.** Open source findings are excluded by design.
 - **SDLC Status filter only shows Production** unless the pipeline adds `--all-releases`.
 
 **Rebuilt history**
