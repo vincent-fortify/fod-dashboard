@@ -1,0 +1,128 @@
+# AppSec dashboard extract: Fortify on Demand -> CSVs -> Azure Blob -> Power BI
+#
+# Secrets (pipeline variable group "fortify-fod", mark all as secret):
+#   FOD_URL            https://api.ams.fortify.com
+#   FOD_CLIENT_ID      API key      (preferred over user credentials for automation)
+#   FOD_CLIENT_SECRET  API secret
+# The API key already identifies the tenant; fcli rejects --tenant with client credentials.
+# Scope the key to the rollout's applications: everything it can see is paged through.
+#
+# Reads dashboard_apps.csv from the repo (the rollout list); it must be committed.
+#
+# Blob upload uses an ARM service connection, so no storage keys live in the pipeline.
+
+trigger: none          # never on commit; this is a data job
+pr: none
+
+schedules:
+  - cron: "0 17 * * *"           # 17:00 UTC = 04:00 AEDT, before anyone opens the report
+    displayName: Nightly AppSec extract
+    branches:
+      include: [main]
+    always: true                 # run even when nothing changed in the repo
+
+variables:
+  - group: fortify-fod
+  - name: FCLI_VERSION
+    value: "3.28.0"
+  - name: OUTPUT_FILE            # monthly snapshot rows (tiles, ageing, trend)
+    value: "appsec_dashboard_latest.csv"
+  - name: SCANS_FILE             # one row per scan (scan history)
+    value: "appsec_dashboard_latest_scans.csv"
+  - name: OUTPUT_DIR
+    value: $(Build.ArtifactStagingDirectory)
+  - name: STORAGE_ACCOUNT
+    value: "stappsecdashboard"
+  - name: STORAGE_CONTAINER
+    value: "powerbi"
+  - name: AZURE_SERVICE_CONNECTION
+    value: "appsec-dashboard-arm"
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - job: extract
+    displayName: Extract FoD data
+    timeoutInMinutes: 180        # raise if the portfolio pull runs long
+
+    steps:
+      - checkout: self
+
+      - task: UsePythonVersion@0
+        displayName: Python 3.11
+        inputs:
+          versionSpec: '3.11'
+
+      - script: |
+          set -euo pipefail
+          curl -fsSL -o fcli.tgz \
+            "https://github.com/fortify/fcli/releases/download/v${FCLI_VERSION}/fcli-linux.tgz"
+          tar -xzf fcli.tgz
+          sudo mv fcli /usr/local/bin/fcli
+          fcli --version
+        displayName: Install fcli $(FCLI_VERSION)
+        env:
+          FCLI_VERSION: $(FCLI_VERSION)
+
+      - script: |
+          set -euo pipefail
+          fcli fod session login \
+            --url "$FOD_URL" \
+            --client-id "$FOD_CLIENT_ID" \
+            --client-secret "$FOD_CLIENT_SECRET"
+          fcli fod session list --validate
+        displayName: FoD login
+        env:
+          FOD_URL: $(FOD_URL)
+          FOD_CLIENT_ID: $(FOD_CLIENT_ID)
+          FOD_CLIENT_SECRET: $(FOD_CLIENT_SECRET)
+
+      # Exit 1 = fatal, 2 = too many release failures: either fails the step, so
+      # nothing below publishes. Months, app list etc. use the script defaults.
+      - script: |
+          set -euo pipefail
+          python3 fod_dashboard_extract.py \
+            --out "$OUTPUT_DIR/$OUTPUT_FILE" \
+            --scans-out "$OUTPUT_DIR/$SCANS_FILE"
+        displayName: Build CSVs
+        env:
+          OUTPUT_DIR: $(OUTPUT_DIR)
+          OUTPUT_FILE: $(OUTPUT_FILE)
+          SCANS_FILE: $(SCANS_FILE)
+
+      - task: AzureCLI@2
+        displayName: Upload to blob
+        inputs:
+          azureSubscription: $(AZURE_SERVICE_CONNECTION)
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            for f in "$(OUTPUT_FILE)" "$(SCANS_FILE)"; do
+              # Power BI always reads this name; overwrite in place
+              az storage blob upload \
+                --account-name "$(STORAGE_ACCOUNT)" \
+                --container-name "$(STORAGE_CONTAINER)" \
+                --name "$f" \
+                --file "$(OUTPUT_DIR)/$f" \
+                --overwrite true \
+                --auth-mode login
+              # dated copy, never read by Power BI, cheap insurance
+              az storage blob upload \
+                --account-name "$(STORAGE_ACCOUNT)" \
+                --container-name "$(STORAGE_CONTAINER)" \
+                --name "archive/$(date -u +%Y/%m/%d)/$f" \
+                --file "$(OUTPUT_DIR)/$f" \
+                --overwrite true \
+                --auth-mode login
+            done
+
+      - publish: $(OUTPUT_DIR)
+        artifact: appsec-dashboard-csv
+        displayName: Publish artifact (for troubleshooting only)
+        condition: always()
+
+      - script: fcli fod session logout
+        displayName: FoD logout
+        condition: always()
